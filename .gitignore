@@ -6,3 +6,4 @@ dist/
 w6n/src/build/
 w6n/bin/asmanalyzer
 *.b_*
+*.b5*_backup
