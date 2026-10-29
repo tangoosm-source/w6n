@@ -1,0 +1,2 @@
+recursive-include w6n/src *.cpp *.hpp *.h *.txt
+include w6n/src/CMakeLists.txt

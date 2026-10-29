@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "w6n"
+version = "0.1.0"
+description = "ARM64 (AArch64) ELF analiz ve roundtrip dogrulama araci"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "w6n" }]
+keywords = ["arm64", "aarch64", "disassembler", "assembler", "elf"]
+
+[project.scripts]
+asmanalyzer = "w6n.cli:main"
+
+[tool.setuptools]
+packages = ["w6n"]
+package-data = { "w6n" = ["bin/asmanalyzer"] }

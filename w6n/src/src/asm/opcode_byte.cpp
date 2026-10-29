@@ -1,0 +1,1991 @@
+#include "opcode_byte.hpp"
+#include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <cerrno>
+#include <string>
+#include <vector>
+
+namespace opcodebyte {
+
+static bool is_32bit(const std::string& reg) {
+    return !reg.empty() && reg[0] == 'w';
+}
+static bool is_sp(const std::string& reg) {
+    return reg == "sp" || reg == "wsp";
+}
+
+static bool parse_reg(const std::string& s, uint32_t& out) {
+    if (s == "sp" || s == "wsp") { out = 31; return true; }
+    if (s == "xzr" || s == "wzr") { out = 31; return true; }
+    if (s.size() < 2) return false;
+    if (s[0] != 'x' && s[0] != 'w') return false;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str() + 1, &end, 10);
+    if (end == s.c_str() + 1 || *end != '\0') return false;
+    if (v < 0 || v > 30) return false;
+    out = (uint32_t)v;
+    return true;
+}
+
+static bool parse_imm(const std::string& s, uint64_t& out) {
+    std::string t = s;
+    if (!t.empty() && t[0] == '#') t.erase(0, 1);
+    if (t.empty()) return false;
+    if (t[0] == '-') return false;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(t.c_str(), &end, 0);
+    if (*end != '\0') return false;
+    out = v;
+    return true;
+}
+
+static bool parse_imm_signed(const std::string& s, int64_t& out) {
+    std::string t = s;
+    if (!t.empty() && t[0] == '#') t.erase(0, 1);
+    if (t.empty()) return false;
+    char* end = nullptr;
+    // Negatif isaret varsa strtoll dogrudan
+    if (t[0] == '-') {
+        long long v = std::strtoll(t.c_str(), &end, 0);
+        if (*end != '\0') return false;
+        out = v;
+        return true;
+    }
+    // Pozitif/unsigned: buyuk hex degerleri strtoull ile parse et,
+    // int64_t'ye 2's complement wrap ile cast et (0xFFFF...E8 -> -24)
+    errno = 0;
+    unsigned long long uv = std::strtoull(t.c_str(), &end, 0);
+    if (*end != '\0') return false;
+    if (errno == ERANGE) return false;
+    out = (int64_t)uv;
+    return true;
+}
+
+static bool parse_shift(const std::string& s, uint32_t& type, uint32_t& amount) {
+    std::string t = s;
+    size_t a = t.find_first_not_of(" \t");
+    if (a == std::string::npos) return false;
+    t = t.substr(a);
+    if      (t.find("lsl") == 0) type = 0;
+    else if (t.find("lsr") == 0) type = 1;
+    else if (t.find("asr") == 0) type = 2;
+    else if (t.find("ror") == 0) type = 3;
+    else return false;
+    size_t hash = t.find('#');
+    if (hash == std::string::npos) { amount = 0; return true; }
+    uint64_t v;
+    if (!parse_imm(t.substr(hash), v)) return false;
+    amount = (uint32_t)v;
+    return true;
+}
+
+static std::vector<std::string> split_ops(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    int depth = 0;
+    for (char c : s) {
+        if (c == '[') { depth++; cur += c; }
+        else if (c == ']') { depth--; cur += c; }
+        else if (c == ',' && depth == 0) { out.push_back(cur); cur.clear(); }
+        else cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    for (auto& x : out) {
+        size_t a = x.find_first_not_of(" \t");
+        size_t b = x.find_last_not_of(" \t");
+        if (a == std::string::npos) { x.clear(); continue; }
+        x = x.substr(a, b - a + 1);
+    }
+    return out;
+}
+
+static bool parse_mem(const std::string& s, uint32_t& rn, uint64_t& imm) {
+    if (s.size() < 3 || s.front() != '[' || s.back() != ']') return false;
+    std::string inner = s.substr(1, s.size() - 2);
+    size_t a = inner.find_first_not_of(" \t");
+    size_t b = inner.find_last_not_of(" \t");
+    if (a == std::string::npos) return false;
+    inner = inner.substr(a, b - a + 1);
+    auto parts = split_ops(inner);
+    if (parts.empty()) return false;
+    if (!parse_reg(parts[0], rn)) return false;
+    if (parts.size() == 1) { imm = 0; return true; }
+    if (parts.size() == 2 && parse_imm(parts[1], imm)) return true;
+    return false;
+}
+
+static bool parse_mem_signed(const std::string& s, uint32_t& rn, int64_t& imm) {
+    if (s.size() < 3 || s.front() != '[' || s.back() != ']') return false;
+    std::string inner = s.substr(1, s.size() - 2);
+    size_t a = inner.find_first_not_of(" \t");
+    size_t b = inner.find_last_not_of(" \t");
+    if (a == std::string::npos) return false;
+    inner = inner.substr(a, b - a + 1);
+    auto parts = split_ops(inner);
+    if (parts.empty()) return false;
+    if (!parse_reg(parts[0], rn)) return false;
+    if (parts.size() == 1) { imm = 0; return true; }
+    if (parts.size() == 2 && parse_imm_signed(parts[1], imm)) return true;
+    return false;
+}
+
+static int cond_to_num(const std::string& c) {
+    if (c == "eq") return 0;
+    if (c == "ne") return 1;
+    if (c == "cs" || c == "hs") return 2;
+    if (c == "cc" || c == "lo") return 3;
+    if (c == "mi") return 4;
+    if (c == "pl") return 5;
+    if (c == "vs") return 6;
+    if (c == "vc") return 7;
+    if (c == "hi") return 8;
+    if (c == "ls") return 9;
+    if (c == "ge") return 10;
+    if (c == "lt") return 11;
+    if (c == "gt") return 12;
+    if (c == "le") return 13;
+    if (c == "al") return 14;
+    if (c == "nv") return 15;
+    return -1;
+}
+
+
+// ============================================================
+// Bitmask immediate encoder (ARM ARM EncodeBitMasks tersi)
+// value -> N:immr:imms  (13-bit encoding, 32 veya 64 bit)
+// Basarisizsa false doner (value gecerli bitmask degil).
+// ============================================================
+static bool encode_bitmask_imm(uint64_t val, int width,
+                                uint32_t& N, uint32_t& immr, uint32_t& imms) {
+    uint64_t all_mask = (width == 64) ? ~0ULL : ((1ULL << width) - 1);
+    val &= all_mask;
+    if (val == 0 || val == all_mask) return false;
+
+    // En kucuk esize'yi bul: val, esize-bit pattern'in replikasyonu mu?
+    int esize = 0;
+    for (int e = 2; e <= width; e <<= 1) {
+        uint64_t emask = (e == 64) ? ~0ULL : ((1ULL << e) - 1);
+        uint64_t pattern = val & emask;
+        if (pattern == 0 || pattern == emask) continue;
+        bool ok = true;
+        for (int pos = e; pos < width; pos += e) {
+            if (((val >> pos) & emask) != pattern) { ok = false; break; }
+        }
+        if (ok) { esize = e; break; }
+    }
+    if (esize == 0) return false;
+
+    int len = 0;
+    while ((1 << len) < esize) len++;
+
+    uint64_t emask = (esize == 64) ? ~0ULL : ((1ULL << esize) - 1);
+    uint64_t pattern = val & emask;
+
+    // ROL(pattern, R) = 0*1* (ones at LSB) olacak R'yi bul
+    for (int R = 0; R < esize; R++) {
+        uint64_t rotated;
+        if (R == 0) rotated = pattern;
+        else if (esize == 64) rotated = (pattern << R) | (pattern >> (64 - R));
+        else rotated = ((pattern << R) | (pattern >> (esize - R))) & emask;
+
+        if (rotated != 0 && (rotated & (rotated + 1)) == 0) {
+            int S = 0;
+            uint64_t t = rotated;
+            while (t & 1) { S++; t >>= 1; }
+            S -= 1;
+            immr = (uint32_t)R;
+            N = (len == 6) ? 1 : 0;
+            imms = ((((uint32_t)(~((1u << len) - 1))) << 1) & 0x3F) | (uint32_t)S;
+            return true;
+        }
+    }
+    return false;
+}
+
+
+// ============================================================
+// SIMD register helper (q/d/s/h/b)
+// ============================================================
+struct SimdInfo { uint32_t num; uint32_t size; uint32_t scale; };;
+static bool parse_simd_reg(const std::string& s, SimdInfo& out) {
+    if (s.size() < 2) return false;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str() + 1, &end, 10);
+    if (end == s.c_str() + 1 || *end != '\0') return false;
+    if (v < 0 || v > 31) return false;
+    out.num = (uint32_t)v;
+    switch (s[0]) {
+        case 'q': out.size = 0; out.scale = 16; return true;  // opc farkli
+        case 'd': out.size = 3; out.scale = 8;  return true;
+        case 's': out.size = 2; out.scale = 4;  return true;
+        case 'h': out.size = 1; out.scale = 2;  return true;
+        case 'b': out.size = 0; out.scale = 1;  return true;
+        default:  return false;
+    }
+}
+static bool is_simd_reg(const std::string& s) {
+    if (s.empty()) return false;
+    char c = s[0];
+    return (c == 'q' || c == 'd' || c == 's' || c == 'h' || c == 'b')
+           && s.size() >= 2 && s[1] >= '0' && s[1] <= '9';
+}
+
+
+// NEON vector register: v0.8b, v0.16b, v0.4h, v0.8h, v0.2s, v0.4s, v0.2d
+static bool parse_vec_reg(const std::string& s_, uint32_t& num,
+                          uint32_t& Q, uint32_t& size, uint32_t& elems) {
+    if (s_.size() < 4 || s_[0] != 'v') return false;
+    size_t dot = s_.find('.');
+    if (dot == std::string::npos) return false;
+    char* end = nullptr;
+    long n = std::strtol(s_.c_str() + 1, &end, 10);
+    if (end != s_.c_str() + dot) return false;
+    if (n < 0 || n > 31) return false;
+    num = (uint32_t)n;
+
+    std::string rest = s_.substr(dot + 1);
+    if (rest.empty()) return false;
+    if (rest.find('[') != std::string::npos) return false;  // scalar: adim 5'te
+
+    char t = rest.back();
+    rest.pop_back();
+    if (rest.empty()) return false;
+    elems = (uint32_t)std::strtoul(rest.c_str(), nullptr, 10);
+    if (elems == 0) return false;
+
+    switch (t) {
+        case 'b': size = 0; Q = (elems == 16) ? 1 : 0; return (elems == 8 || elems == 16);
+        case 'h': size = 1; Q = (elems == 8)  ? 1 : 0; return (elems == 4 || elems == 8);
+        case 's': size = 2; Q = (elems == 4)  ? 1 : 0; return (elems == 2 || elems == 4);
+        case 'd': size = 3; Q = (elems == 2)  ? 1 : 0; return (elems == 1 || elems == 2);
+        default:  return false;
+    }
+}
+
+
+// Sysreg lookup: isim -> (op0, op1, cn, cm, op2)
+static bool lookup_sysreg_name(const std::string& n, uint32_t& o0, uint32_t& o1, uint32_t& cn, uint32_t& cm, uint32_t& o2) {
+    struct E { const char* n; uint32_t o0, o1, cn, cm, o2; };
+    static const E tab[] = {
+        {"nzcv",       3,3, 4, 2,0}, {"fpcr",       3,3, 4, 4,0},
+        {"fpsr",       3,3, 4, 4,1}, {"tpidr_el0",  3,3,13, 0,2},
+        {"tpidrro_el0",3,3,13, 0,3}, {"tpidr_el1",  3,0,13, 0,4},
+        {"cntvct_el0", 3,3,14, 0,2}, {"cntfrq_el0", 3,3,14, 0,0},
+        {"cntpct_el0", 3,3,14, 0,1}, {"ctr_el0",    3,3, 0, 0,1},
+        {"dczid_el0",  3,3, 0, 0,7}, {"midr_el1",   3,0, 0, 0,0},
+        {"mpidr_el1",  3,0, 0, 0,5}, {"currentel",  3,0, 4, 2,2},
+        {"daif",       3,3, 4, 2,1}, {"sp_el0",     3,0, 4, 1,0},
+        {"elr_el1",    3,0, 4, 0,1}, {"spsr_el1",   3,0, 4, 0,0},
+        {"spsel",      3,0, 4, 2,0}, {"pan",        3,0, 4, 2,3},
+        {"uao",        3,0, 4, 2,4}, {"tpidr_el2",  3,4,13, 0,2},
+        {"tpidr_el3",  3,6,13, 0,2}, {"vbar_el1",   3,0,12, 0,0},
+        {"ttbr0_el1",  3,0, 2, 0,0}, {"ttbr1_el1",  3,0, 2, 0,1},
+        {"sctlr_el1",  3,0, 1, 0,0}, {"esr_el1",    3,0, 5, 2,0},
+        {"far_el1",    3,0, 6, 0,0},
+    };
+    for (auto& e : tab) if (n == e.n) { o0=e.o0; o1=e.o1; cn=e.cn; cm=e.cm; o2=e.o2; return true; }
+    return false;
+}
+
+// Generic: "s3_0_c4_c4_0" -> op0,op1,cn,cm,op2
+static bool parse_generic_sysreg(const std::string& n, uint32_t& o0, uint32_t& o1, uint32_t& cn, uint32_t& cm, uint32_t& o2) {
+    if (n.size() < 9 || n[0] != 's') return false;
+    int a=0,b=0,c=0,d=0,e=0;
+    if (std::sscanf(n.c_str(), "s%d_%d_c%d_c%d_%d", &a,&b,&c,&d,&e) != 5) return false;
+    o0=(uint32_t)a; o1=(uint32_t)b; cn=(uint32_t)c; cm=(uint32_t)d; o2=(uint32_t)e;
+    return true;
+}
+
+Result encode(const std::string& mnemonic,
+              const std::string& operands,
+              uint64_t address,
+              Mode mode)
+{
+    (void)mode;
+    Result r;
+    auto ops = split_ops(operands);
+
+    if (mnemonic == "nop" && ops.empty()) {
+        r.value = 0xD503201Fu; r.ok = true; return r;
+    }
+    if (mnemonic == "ret" && (ops.empty() || ops[0] == "x30")) {
+        r.value = 0xD65F03C0u; r.ok = true; return r;
+    }
+    if ((mnemonic == "br" || mnemonic == "blr") && ops.size() == 1) {
+        uint32_t rn;
+        if (!parse_reg(ops[0], rn)) { r.error = "br/blr reg"; return r; }
+        uint32_t base = (mnemonic == "br") ? 0xD61F0000u : 0xD63F0000u;
+        r.value = base | (rn << 5); r.ok = true; return r;
+    }
+    if (mnemonic == "svc" && ops.size() == 1) {
+        uint64_t imm;
+        if (!parse_imm(ops[0], imm) || imm > 0xFFFF) { r.error = "svc imm"; return r; }
+        r.value = 0xD4000001u | ((uint32_t)imm << 5); r.ok = true; return r;
+    }
+
+    // ---- b.cond ----
+    if (mnemonic.size() > 2 && mnemonic[0] == 'b' && mnemonic[1] == '.'
+        && ops.size() == 1) {
+        int cond = cond_to_num(mnemonic.substr(2));
+        if (cond < 0) { r.error = "bilinmeyen cond"; return r; }
+        uint64_t target;
+        if (!parse_imm(ops[0], target)) { r.error = "target"; return r; }
+        int64_t offset = (int64_t)target - (int64_t)address;
+        if (offset % 4 != 0) { r.error = "align"; return r; }
+        int64_t imm19 = offset / 4;
+        if (imm19 < -(1LL << 18) || imm19 >= (1LL << 18)) {
+            r.error = "imm19 range"; return r;
+        }
+        r.value = 0x54000000u
+                | (((uint32_t)imm19 & 0x7FFFFu) << 5)
+                | (uint32_t)cond;
+        r.ok = true; return r;
+    }
+
+    // ---- b / bl ----
+    if ((mnemonic == "b" || mnemonic == "bl") && ops.size() == 1) {
+        uint64_t target;
+        if (!parse_imm(ops[0], target)) { r.error = "target"; return r; }
+        int64_t offset = (int64_t)target - (int64_t)address;
+        if (offset % 4 != 0) { r.error = "align"; return r; }
+        int64_t imm26 = offset / 4;
+        if (imm26 < -(1LL << 25) || imm26 >= (1LL << 25)) {
+            r.error = "imm26 range"; return r;
+        }
+        uint32_t base = (mnemonic == "b") ? 0x14000000u : 0x94000000u;
+        r.value = base | ((uint32_t)imm26 & 0x3FFFFFFu);
+        r.ok = true; return r;
+    }
+
+    // ---- cbz / cbnz ----
+    if ((mnemonic == "cbz" || mnemonic == "cbnz") && ops.size() == 2) {
+        uint32_t rt;
+        if (!parse_reg(ops[0], rt)) { r.error = "rt"; return r; }
+        uint64_t target;
+        if (!parse_imm(ops[1], target)) { r.error = "target"; return r; }
+        int64_t offset = (int64_t)target - (int64_t)address;
+        if (offset % 4 != 0) { r.error = "align"; return r; }
+        int64_t imm19 = offset / 4;
+        if (imm19 < -(1LL << 18) || imm19 >= (1LL << 18)) {
+            r.error = "imm19"; return r;
+        }
+        bool w = is_32bit(ops[0]);
+        uint32_t base;
+        if (mnemonic == "cbz") base = w ? 0x34000000u : 0xB4000000u;
+        else                   base = w ? 0x35000000u : 0xB5000000u;
+        r.value = base | (((uint32_t)imm19 & 0x7FFFFu) << 5) | rt;
+        r.ok = true; return r;
+    }
+
+    // ---- tbz / tbnz ----
+    if ((mnemonic == "tbz" || mnemonic == "tbnz") && ops.size() == 3) {
+        uint32_t rt;
+        if (!parse_reg(ops[0], rt)) { r.error = "rt"; return r; }
+        uint64_t bit;
+        if (!parse_imm(ops[1], bit) || bit > 63) { r.error = "bit"; return r; }
+        bool w = is_32bit(ops[0]);
+        if (w && bit > 31) { r.error = "w bit<=31"; return r; }
+        uint64_t target;
+        if (!parse_imm(ops[2], target)) { r.error = "target"; return r; }
+        int64_t offset = (int64_t)target - (int64_t)address;
+        if (offset % 4 != 0) { r.error = "align"; return r; }
+        int64_t imm14 = offset / 4;
+        if (imm14 < -(1LL << 13) || imm14 >= (1LL << 13)) {
+            r.error = "imm14"; return r;
+        }
+        uint32_t base = (mnemonic == "tbz") ? 0x36000000u : 0x37000000u;
+        uint32_t b5  = (bit & 0x20) ? 1u : 0u;
+        uint32_t b40 = (uint32_t)(bit & 0x1Fu);
+        r.value = base
+                | (b5 << 31)
+                | (b40 << 19)
+                | (((uint32_t)imm14 & 0x3FFFu) << 5)
+                | rt;
+        r.ok = true; return r;
+    }
+
+    // ---- adr / adrp ----
+    if ((mnemonic == "adr" || mnemonic == "adrp") && ops.size() == 2) {
+        uint32_t rd;
+        if (!parse_reg(ops[0], rd)) { r.error = "rd"; return r; }
+        uint64_t target;
+        if (!parse_imm(ops[1], target)) { r.error = "target"; return r; }
+
+        int64_t imm21;
+        if (mnemonic == "adr") {
+            imm21 = (int64_t)target - (int64_t)address;
+            if (imm21 < -(1LL << 20) || imm21 >= (1LL << 20)) {
+                r.error = "adr range"; return r;
+            }
+        } else {
+            if (target & 0xFFF) { r.error = "adrp sayfa hizali degil"; return r; }
+            int64_t page_target = (int64_t)(target >> 12);
+            int64_t page_pc     = (int64_t)(address >> 12);
+            imm21 = page_target - page_pc;
+            if (imm21 < -(1LL << 20) || imm21 >= (1LL << 20)) {
+                r.error = "adrp range"; return r;
+            }
+        }
+        uint32_t immlo = (uint32_t)(imm21 & 0x3);
+        uint32_t immhi = (uint32_t)((imm21 >> 2) & 0x7FFFF);
+        uint32_t base  = (mnemonic == "adrp") ? 0x90000000u : 0x10000000u;
+        r.value = base | (immlo << 29) | (immhi << 5) | rd;
+        r.ok = true; return r;
+    }
+
+    // ---- udiv / sdiv ----
+    if ((mnemonic == "udiv" || mnemonic == "sdiv") && ops.size() == 3) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            bool w = is_32bit(ops[0]);
+            bool sd = (mnemonic == "sdiv");
+            uint32_t base = sd ? (w ? 0x1AC00C00u : 0x9AC00C00u)
+                               : (w ? 0x1AC00800u : 0x9AC00800u);
+            r.value = base | (rm << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- ubfiz / sbfiz / bfi ----
+    if ((mnemonic == "ubfiz" || mnemonic == "sbfiz" || mnemonic == "bfi")
+        && ops.size() == 4) {
+        uint32_t rd, rn;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            uint64_t lsb = 0, width = 0;
+            if (parse_imm(ops[2], lsb) && parse_imm(ops[3], width) && width > 0) {
+                bool w = is_32bit(ops[0]);
+                uint32_t datasize = w ? 32 : 64;
+                if (lsb + width <= datasize) {
+                    uint32_t base = 0;
+                    if (mnemonic == "ubfiz") base = w ? 0x53000000u : 0xD3400000u;
+                    if (mnemonic == "sbfiz") base = w ? 0x13000000u : 0x93400000u;
+                    if (mnemonic == "bfi")   base = w ? 0x33000000u : 0xB3400000u;
+                    uint32_t immr = (uint32_t)((datasize - lsb) & (datasize - 1));
+                    uint32_t imms = (uint32_t)(width - 1);
+                    r.value = base | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- ubfx / sbfx / bfxil ----
+    if ((mnemonic == "ubfx" || mnemonic == "sbfx" || mnemonic == "bfxil")
+        && ops.size() == 4) {
+        uint32_t rd, rn;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            uint64_t lsb = 0, width = 0;
+            if (parse_imm(ops[2], lsb) && parse_imm(ops[3], width) && width > 0) {
+                bool w = is_32bit(ops[0]);
+                uint32_t max_w = w ? 32 : 64;
+                if (lsb + width <= max_w) {
+                    uint32_t base = 0, immr = 0, imms = 0;
+                    if (mnemonic == "ubfx") {
+                        base = w ? 0x53000000u : 0xD3400000u;
+                        immr = (uint32_t)lsb;
+                        imms = (uint32_t)(lsb + width - 1);
+                    } else if (mnemonic == "sbfx") {
+                        base = w ? 0x13000000u : 0x93400000u;
+                        immr = (uint32_t)lsb;
+                        imms = (uint32_t)(lsb + width - 1);
+                    } else {
+                        base = w ? 0x33000000u : 0xB3400000u;
+                        immr = (uint32_t)lsb;
+                        imms = (uint32_t)(lsb + width - 1);
+                    }
+                    if (w) { immr &= 0x1F; imms &= 0x1F; }
+                    r.value = base | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- clz / cls ----
+    if ((mnemonic == "clz" || mnemonic == "cls") && ops.size() == 2) {
+        uint32_t rd, rn;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            bool w = is_32bit(ops[0]);
+            bool cs = (mnemonic == "cls");
+            uint32_t base = cs ? (w ? 0x5AC01400u : 0xDAC01400u)
+                               : (w ? 0x5AC01000u : 0xDAC01000u);
+            r.value = base | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- rbit / rev / rev16 / rev32 ----
+    if ((mnemonic == "rbit" || mnemonic == "rev" ||
+         mnemonic == "rev16" || mnemonic == "rev32") && ops.size() == 2) {
+        uint32_t rd, rn;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            bool w = is_32bit(ops[0]);
+            uint32_t base = 0;
+            if (mnemonic == "rbit") {
+                base = w ? 0x5AC00000u : 0xDAC00000u;
+            } else if (mnemonic == "rev16") {
+                base = w ? 0x5AC00400u : 0xDAC00400u;
+            } else if (mnemonic == "rev32") {
+                base = 0xDAC00800u;
+            } else {
+                base = w ? 0x5AC00800u : 0xDAC00C00u;
+            }
+            r.value = base | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- mvn / neg / ngc aliases ----
+    if ((mnemonic == "mvn" || mnemonic == "neg" || mnemonic == "ngc")
+        && (ops.size() == 2 || ops.size() == 3)) {
+        uint32_t rd, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rm)) {
+            bool w = is_32bit(ops[0]);
+            if (mnemonic == "mvn") {
+                // orn Rd, xzr, Rm
+                r.value = (w ? 0x2A2003E0u : 0xAA2003E0u) | (rm << 16) | rd;
+                r.ok = true; return r;
+            }
+            if (mnemonic == "neg") {
+                // sub Rd, xzr, Rm [, lsl/lsr/asr/ror #N]
+                uint32_t shift = 0, st = 0;
+                if (ops.size() == 3) {
+                    uint32_t sa = 0;
+                    if (parse_shift(ops[2], st, sa) && sa <= 63)
+                        shift = sa;
+                }
+                r.value = (w ? 0x4B0003E0u : 0xCB0003E0u)
+                        | (st << 22) | (rm << 16) | (shift << 10) | rd;
+                r.ok = true; return r;
+            }
+            if (mnemonic == "ngc") {
+                // sbc Rd, xzr, Rm
+                r.value = (w ? 0x5A0003E0u : 0xDA0003E0u) | (rm << 16) | rd;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- dmb / dsb / isb ----
+    if ((mnemonic == "dmb" || mnemonic == "dsb" || mnemonic == "isb")
+        && ops.size() <= 1) {
+        std::string opt = ops.empty() ? "sy" : ops[0];
+        if (!opt.empty() && opt[0] == '#') opt.erase(0, 1);
+        uint32_t opt4 = 0;
+        bool ok_opt = true;
+        if      (opt == "oshld") opt4 = 0x1;
+        else if (opt == "oshst") opt4 = 0x2;
+        else if (opt == "osh")   opt4 = 0x3;
+        else if (opt == "nshld") opt4 = 0x5;
+        else if (opt == "nshst") opt4 = 0x6;
+        else if (opt == "nsh")   opt4 = 0x7;
+        else if (opt == "ishld") opt4 = 0x9;
+        else if (opt == "ishst") opt4 = 0xA;
+        else if (opt == "ish")   opt4 = 0xB;
+        else if (opt == "ld")    opt4 = 0xD;
+        else if (opt == "st")    opt4 = 0xE;
+        else if (opt == "sy")    opt4 = 0xF;
+        else {
+            uint64_t num = 0;
+            if (parse_imm(opt, num) && num <= 15) opt4 = (uint32_t)num;
+            else ok_opt = false;
+        }
+        if (ok_opt) {
+            uint32_t base = 0;
+            if      (mnemonic == "dmb") base = 0xD50330BFu;
+            else if (mnemonic == "dsb") base = 0xD503309Fu;
+            else                        base = 0xD5033FDFu;
+            r.value = base | (opt4 << 8);
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- ldar/stlr ----
+    if ((mnemonic == "ldar" || mnemonic == "stlr" ||
+         mnemonic == "ldarb" || mnemonic == "ldarh" ||
+         mnemonic == "stlrb" || mnemonic == "stlrh") && ops.size() == 2) {
+        uint32_t rt, rn; uint64_t dummy;
+        if (parse_reg(ops[0], rt) && parse_mem(ops[1], rn, dummy) && dummy == 0) {
+            uint32_t base = 0;
+            if (mnemonic == "ldar")  base = is_32bit(ops[0]) ? 0x88DFFC00u : 0xC8DFFC00u;
+            if (mnemonic == "stlr")  base = is_32bit(ops[0]) ? 0x889FFC00u : 0xC89FFC00u;
+            if (mnemonic == "ldarb") base = 0x08DFFC00u;
+            if (mnemonic == "ldarh") base = 0x48DFFC00u;
+            if (mnemonic == "stlrb") base = 0x089FFC00u;
+            if (mnemonic == "stlrh") base = 0x489FFC00u;
+            r.value = base | (rn << 5) | rt;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- umulh/smulh ----
+    if ((mnemonic == "umulh" || mnemonic == "smulh") && ops.size() == 3) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            uint32_t base = (mnemonic == "smulh") ? 0x9B407C00u : 0x9BC07C00u;
+            r.value = base | (rm << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- smaddl/umaddl/smsubl/umsubl/smull/umull ----
+    if ((mnemonic == "smaddl" || mnemonic == "umaddl" ||
+         mnemonic == "smsubl" || mnemonic == "umsubl" ||
+         mnemonic == "smull"  || mnemonic == "umull")
+        && (ops.size() == 3 || ops.size() == 4)) {
+        uint32_t rd, rn, rm, ra = 31;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            if (ops.size() == 4 && !parse_reg(ops[3], ra)) { r.error = "ra"; return r; }
+            bool is_u = (mnemonic[0] == 'u');
+            bool is_s = (mnemonic.find("sub") != std::string::npos);
+            uint32_t base = is_u ? 0x9BA00000u : 0x9B200000u;
+            if (is_s) base |= 0x8000u;
+            r.value = base | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- brk ----
+    if (mnemonic == "brk" && ops.size() == 1) {
+        uint64_t imm;
+        if (parse_imm(ops[0], imm) && imm <= 0xFFFF) {
+            r.value = 0xD4200000u | ((uint32_t)imm << 5);
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- NEON cmXX vX.T, vY.T, #0 ----
+    if ((mnemonic == "cmge" || mnemonic == "cmgt" || mnemonic == "cmeq"
+         || mnemonic == "cmlt" || mnemonic == "cmle") && ops.size() == 3) {
+        uint64_t zv = 1;
+        if (parse_imm(ops[2], zv) && zv == 0) {
+            uint32_t rd, Q1, s1, e1, rn, Q2, s2, e2;
+            if (parse_vec_reg(ops[0], rd, Q1, s1, e1) &&
+                parse_vec_reg(ops[1], rn, Q2, s2, e2)) {
+                if (Q1 == Q2 && s1 == s2) {
+                    uint32_t base = 0;
+                    if      (mnemonic == "cmgt") base = 0x0E200800u;
+                    else if (mnemonic == "cmge") base = 0x2E208800u;
+                    else if (mnemonic == "cmeq") base = 0x0E209800u;
+                    else if (mnemonic == "cmlt") base = 0x0E20A800u;
+                    else if (mnemonic == "cmle") base = 0x2E209800u;
+                    r.value = base | (Q1 << 30) | (s1 << 22) | (rn << 5) | rd;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- mrs / msr ----
+    if ((mnemonic == "mrs" || mnemonic == "msr") && ops.size() == 2) {
+        uint32_t rt = 0;
+        std::string sysreg;
+        bool is_mrs = (mnemonic == "mrs");
+        if (is_mrs) {
+            if (!parse_reg(ops[0], rt)) { r.error = "mrs Rt"; return r; }
+            sysreg = ops[1];
+        } else {
+            sysreg = ops[0];
+            if (!parse_reg(ops[1], rt)) { r.error = "msr Rt"; return r; }
+        }
+        uint32_t o0, o1, cn, cm, o2;
+        if (lookup_sysreg_name(sysreg, o0, o1, cn, cm, o2) ||
+            parse_generic_sysreg(sysreg, o0, o1, cn, cm, o2)) {
+            uint32_t base = is_mrs ? 0xD5300000u : 0xD5100000u;
+            r.value = base
+                    | ((o0 & 0x3) << 19)
+                    | ((o1 & 0x7) << 16)
+                    | ((cn & 0xF) << 12)
+                    | ((cm & 0xF) << 8)
+                    | ((o2 & 0x7) << 5)
+                    | (rt & 0x1F);
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- bti / pac* / aut* (sabit instructions) ----
+    if (ops.size() <= 1) {
+        uint32_t fixed = 0;
+        if (mnemonic == "bti") {
+            std::string lvl = ops.empty() ? "" : ops[0];
+            if      (lvl == "c")  fixed = 0xD503245Fu;
+            else if (lvl == "j")  fixed = 0xD503249Fu;
+            else if (lvl == "jc") fixed = 0xD50324DFu;
+            else if (lvl.empty()) fixed = 0xD503241Fu;
+        }
+        else if (mnemonic == "paciasp")  fixed = 0xD503233Fu;
+        else if (mnemonic == "autiasp")  fixed = 0xD50323BFu;
+        else if (mnemonic == "pacibsp")  fixed = 0xD503237Fu;
+        else if (mnemonic == "autibsp")  fixed = 0xD50323FFu;
+        else if (mnemonic == "pacia1716") fixed = 0xD503211Fu;
+        else if (mnemonic == "autia1716") fixed = 0xD503219Fu;
+        else if (mnemonic == "pacib1716") fixed = 0xD503215Fu;
+        else if (mnemonic == "autib1716") fixed = 0xD50321DFu;
+        if (fixed) { r.value = fixed; r.ok = true; return r; }
+    }
+
+    // ---- adc / sbc / adcs / sbcs ----
+    if ((mnemonic == "adc" || mnemonic == "sbc" ||
+         mnemonic == "adcs" || mnemonic == "sbcs") && ops.size() == 3) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            bool w = is_32bit(ops[0]);
+            bool is_sub = (mnemonic == "sbc" || mnemonic == "sbcs");
+            bool is_s = (mnemonic == "adcs" || mnemonic == "sbcs");
+            uint32_t base;
+            if (w) base = is_sub ? 0x5A000000u : 0x1A000000u;
+            else   base = is_sub ? 0xDA000000u : 0x9A000000u;
+            if (is_s) base |= 0x20000000u;
+            r.value = base | (rm << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- movz / movn / movk ----
+    if ((mnemonic == "movz" || mnemonic == "movn" || mnemonic == "movk")
+        && (ops.size() == 2 || ops.size() == 3)) {
+        uint32_t rd;
+        if (!parse_reg(ops[0], rd)) { r.error = "reg"; return r; }
+        bool w = is_32bit(ops[0]);
+        uint64_t imm;
+        if (!parse_imm(ops[1], imm) || imm > 0xFFFF) { r.error = "imm16"; return r; }
+        uint32_t hw = 0;
+        if (ops.size() == 3) {
+            std::string sf = ops[2];
+            if (sf.find("lsl") == std::string::npos) { r.error = "only lsl"; return r; }
+            size_t hash = sf.find('#');
+            if (hash == std::string::npos) { r.error = "lsl #N"; return r; }
+            uint64_t sh;
+            if (!parse_imm(sf.substr(hash), sh) || (sh % 16) != 0) {
+                r.error = "lsl 16*k"; return r;
+            }
+            hw = (uint32_t)(sh / 16);
+            if (w && hw > 1) { r.error = "w hw max 1"; return r; }
+            if (hw > 3) { r.error = "hw too big"; return r; }
+        }
+        uint32_t base;
+        if      (mnemonic == "movz") base = w ? 0x52800000u : 0xD2800000u;
+        else if (mnemonic == "movn") base = w ? 0x12800000u : 0x92800000u;
+        else                         base = w ? 0x72800000u : 0xF2800000u;
+        r.value = base | (hw << 21) | ((uint32_t)imm << 5) | rd;
+        r.ok = true; return r;
+    }
+
+    // ---- lsl/lsr/asr/ror register form (LSLV/LSRV/ASRV/RORV) ----
+    if ((mnemonic == "lsl" || mnemonic == "lsr" ||
+         mnemonic == "asr" || mnemonic == "ror") && ops.size() == 3) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            bool w = is_32bit(ops[0]);
+            uint32_t base = 0;
+            if (mnemonic == "lsl") base = w ? 0x1AC02000u : 0x9AC02000u;
+            if (mnemonic == "lsr") base = w ? 0x1AC02400u : 0x9AC02400u;
+            if (mnemonic == "asr") base = w ? 0x1AC02800u : 0x9AC02800u;
+            if (mnemonic == "ror") base = w ? 0x1AC02C00u : 0x9AC02C00u;
+            r.value = base | (rm << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- lsl / lsr / asr / ror ----
+    if ((mnemonic == "lsl" || mnemonic == "lsr" || mnemonic == "asr" || mnemonic == "ror")
+        && ops.size() == 3) {
+        uint32_t rd, rn;
+        if (!parse_reg(ops[0], rd) || !parse_reg(ops[1], rn)) { r.error = "reg"; return r; }
+        uint64_t sh;
+        if (!parse_imm(ops[2], sh)) { r.error = "shift imm"; return r; }
+        bool w = is_32bit(ops[0]);
+        uint32_t max_sh = w ? 31 : 63;
+        if (sh > max_sh) { r.error = "shift amount"; return r; }
+        uint32_t s = (uint32_t)sh;
+        if (mnemonic == "lsl") {
+            uint32_t immr = (max_sh + 1 - s) & max_sh;
+            uint32_t imms = max_sh - s;
+            uint32_t base = w ? 0x53000000u : 0xD3400000u;
+            r.value = base | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+        } else if (mnemonic == "lsr") {
+            uint32_t base = w ? 0x53000000u : 0xD3400000u;
+            r.value = base | (s << 16) | (max_sh << 10) | (rn << 5) | rd;
+        } else if (mnemonic == "asr") {
+            uint32_t base = w ? 0x13000000u : 0x93400000u;
+            r.value = base | (s << 16) | (max_sh << 10) | (rn << 5) | rd;
+        } else {
+            uint32_t base = w ? 0x13800000u : 0x93C00000u;
+            r.value = base | (rn << 16) | (s << 10) | (rn << 5) | rd;
+        }
+        r.ok = true; return r;
+    }
+
+    // ---- SIMD stp/ldp (signed offset, q register) ----
+    if ((mnemonic == "stp" || mnemonic == "ldp")
+        && ops.size() == 3 && is_simd_reg(ops[0]) && is_simd_reg(ops[1])) {
+        SimdInfo i1, i2;
+        uint32_t rn; int64_t imm;
+        if (parse_simd_reg(ops[0], i1) && parse_simd_reg(ops[1], i2)
+            && parse_mem_signed(ops[2], rn, imm)) {
+            if (ops[0][0] == 'q' && ops[1][0] == 'q') {
+                if (imm % 16 == 0) {
+                    int64_t imm7 = imm / 16;
+                    if (imm7 >= -64 && imm7 <= 63) {
+                        bool ld = (mnemonic == "ldp");
+                        uint32_t base = ld ? 0xAD400000u : 0xAD000000u;
+                        r.value = base
+                                | (((uint32_t)imm7 & 0x7Fu) << 15)
+                                | (i2.num << 10) | (rn << 5) | i1.num;
+                        r.ok = true; return r;
+                    }
+                }
+            } else if (ops[0][0] == 'd' && ops[1][0] == 'd') {
+                if (imm % 8 == 0) {
+                    int64_t imm7 = imm / 8;
+                    if (imm7 >= -64 && imm7 <= 63) {
+                        bool ld = (mnemonic == "ldp");
+                        uint32_t base = ld ? 0x6D400000u : 0x6D000000u;
+                        r.value = base
+                                | (((uint32_t)imm7 & 0x7Fu) << 15)
+                                | (i2.num << 10) | (rn << 5) | i1.num;
+                        r.ok = true; return r;
+                    }
+                }
+            } else if (ops[0][0] == 's' && ops[1][0] == 's') {
+                if (imm % 4 == 0) {
+                    int64_t imm7 = imm / 4;
+                    if (imm7 >= -64 && imm7 <= 63) {
+                        bool ld = (mnemonic == "ldp");
+                        uint32_t base = ld ? 0x2D400000u : 0x2D000000u;
+                        r.value = base
+                                | (((uint32_t)imm7 & 0x7Fu) << 15)
+                                | (i2.num << 10) | (rn << 5) | i1.num;
+                        r.ok = true; return r;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- stp / ldp ----
+    if ((mnemonic == "stp" || mnemonic == "ldp") && (ops.size() == 3 || ops.size() == 4)) {
+        uint32_t rt, rt2, rn;
+        int64_t imm = 0;
+        if (!parse_reg(ops[0], rt))  { r.error = "Rt";  return r; }
+        if (!parse_reg(ops[1], rt2)) { r.error = "Rt2"; return r; }
+        bool w = is_32bit(ops[0]);
+        bool is_load = (mnemonic == "ldp");
+        size_t scale = w ? 4 : 8;
+        uint32_t base;
+        if (ops.size() == 4) {
+            uint64_t dummy;
+            if (!parse_mem(ops[2], rn, dummy) || dummy != 0) {
+                r.error = "post: [Rn]"; return r;
+            }
+            if (!parse_imm_signed(ops[3], imm)) { r.error = "post imm"; return r; }
+            base = is_load ? (w ? 0x28C00000u : 0xA8C00000u)
+                           : (w ? 0x28800000u : 0xA8800000u);
+        } else {
+            std::string mem = ops[2];
+            bool pre = (!mem.empty() && mem.back() == '!');
+            if (pre) mem.pop_back();
+            if (!parse_mem_signed(mem, rn, imm)) { r.error = "mem"; return r; }
+            if (pre) {
+                base = is_load ? (w ? 0x29C00000u : 0xA9C00000u)
+                               : (w ? 0x29800000u : 0xA9800000u);
+            } else {
+                base = is_load ? (w ? 0x29400000u : 0xA9400000u)
+                               : (w ? 0x29000000u : 0xA9000000u);
+            }
+        }
+        if (imm % (int64_t)scale != 0) { r.error = "scale"; return r; }
+        int64_t imm7 = imm / (int64_t)scale;
+        if (imm7 < -64 || imm7 > 63) { r.error = "imm7"; return r; }
+        r.value = base
+                | (((uint32_t)imm7 & 0x7Fu) << 15)
+                | (rt2 << 10) | (rn << 5) | rt;
+        r.ok = true; return r;
+    }
+
+    // ---- NEON mov vX.T, vY.T (ORR Vd.T, Vn.T, Vn.T) ----
+    if (mnemonic == "mov" && ops.size() == 2) {
+        uint32_t rd, Q1, s1, e1, rn, Q2, s2, e2;
+        if (parse_vec_reg(ops[0], rd, Q1, s1, e1) &&
+            parse_vec_reg(ops[1], rn, Q2, s2, e2)) {
+            if (Q1 != Q2) { r.error = "mov v Q mismatch"; return r; }
+            uint32_t base = Q1 ? 0x4EA01C00u : 0x0EA01C00u;
+            r.value = base | (rn << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- mov ----
+    if (mnemonic == "mov" && ops.size() == 2) {
+        if (is_sp(ops[1])) {
+            uint32_t rd;
+            if (!parse_reg(ops[0], rd)) { r.error = "mov rd"; return r; }
+            bool w = is_32bit(ops[0]);
+            r.value = (w ? 0x110003E0u : 0x910003E0u) | rd; r.ok = true; return r;
+        }
+        if (is_sp(ops[0])) {
+            uint32_t rn;
+            if (!parse_reg(ops[1], rn)) { r.error = "mov rn"; return r; }
+            bool w = is_32bit(ops[0]);
+            r.value = (w ? 0x1100001Fu : 0x9100001Fu) | (rn << 5); r.ok = true; return r;
+        }
+        uint32_t rd;
+        if (!parse_reg(ops[0], rd)) { r.error = "mov rd"; return r; }
+        bool w = is_32bit(ops[0]);
+        uint32_t rm;
+        if (parse_reg(ops[1], rm)) {
+            r.value = (w ? 0x2A0003E0u : 0xAA0003E0u) | (rm << 16) | rd;
+            r.ok = true; return r;
+        }
+        uint64_t imm = 0;
+        int64_t simm = 0;
+        if (!parse_imm(ops[1], imm)) {
+            if (parse_imm_signed(ops[1], simm))
+                imm = (uint64_t)simm;
+            else { r.error = "mov imm"; return r; }
+        }
+        int width = w ? 32 : 64;
+        uint64_t val = imm & (w ? 0xFFFFFFFFu : ~0ULL);
+        int n_hw = width / 16;
+
+        // 1) movz: val == imm16 << (16*hw)
+        for (int hw = 0; hw < n_hw; hw++) {
+            uint32_t shift = (uint32_t)(16 * hw);
+            uint64_t shifted = val >> shift;
+            if ((shifted << shift) == val && shifted <= 0xFFFF) {
+                r.value = (w ? 0x52800000u : 0xD2800000u)
+                        | ((uint32_t)hw << 21) | ((uint32_t)shifted << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+
+        // 2) movn: ~val == imm16 << (16*hw)
+        uint64_t nv = (~val) & (w ? 0xFFFFFFFFu : ~0ULL);
+        for (int hw = 0; hw < n_hw; hw++) {
+            uint32_t shift = (uint32_t)(16 * hw);
+            uint64_t shifted = nv >> shift;
+            if ((shifted << shift) == nv && shifted <= 0xFFFF) {
+                r.value = (w ? 0x12800000u : 0x92800000u)
+                        | ((uint32_t)hw << 21) | ((uint32_t)shifted << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+
+        // 3) bitmask (orr Xd, XZR, #imm)
+        {
+            uint32_t N, immr, imms;
+            if (encode_bitmask_imm(val, width, N, immr, imms)) {
+                r.value = (w ? 0x320003E0u : 0xB20003E0u)
+                        | (N << 22) | (immr << 16) | (imms << 10) | rd;
+                r.ok = true; return r;
+            }
+        }
+        r.error = "mov imm cannot encode"; return r;
+    }
+
+    // ---- add/sub extended register form ----
+    if ((mnemonic == "add" || mnemonic == "sub" ||
+         mnemonic == "adds" || mnemonic == "subs") && ops.size() == 4) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            std::string ext = ops[3];
+            uint32_t option = 0; bool is_ext = false;
+            if      (ext.find("uxtb") != std::string::npos) { option = 0; is_ext = true; }
+            else if (ext.find("uxth") != std::string::npos) { option = 1; is_ext = true; }
+            else if (ext.find("uxtw") != std::string::npos) { option = 2; is_ext = true; }
+            else if (ext.find("uxtx") != std::string::npos) { option = 3; is_ext = true; }
+            else if (ext.find("sxtb") != std::string::npos) { option = 4; is_ext = true; }
+            else if (ext.find("sxth") != std::string::npos) { option = 5; is_ext = true; }
+            else if (ext.find("sxtw") != std::string::npos) { option = 6; is_ext = true; }
+            else if (ext.find("sxtx") != std::string::npos) { option = 7; is_ext = true; }
+            if (is_ext) {
+                uint32_t imm3 = 0;
+                size_t hash = ext.find('#');
+                if (hash != std::string::npos) {
+                    uint64_t sh = 0;
+                    if (parse_imm(ext.substr(hash), sh) && sh <= 4)
+                        imm3 = (uint32_t)sh;
+                }
+                bool w = is_32bit(ops[0]);
+                bool is_sub = (mnemonic == "sub" || mnemonic == "subs");
+                bool s_bit = (mnemonic == "adds" || mnemonic == "subs");
+                uint32_t base = is_sub ? (w ? 0x4B200000u : 0xCB200000u)
+                                       : (w ? 0x0B200000u : 0x8B200000u);
+                if (s_bit) base |= 0x20000000u;
+                r.value = base | (rm << 16) | (option << 13) | (imm3 << 10)
+                        | (rn << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- add/sub ----
+    if ((mnemonic == "add" || mnemonic == "sub") && (ops.size() == 3 || ops.size() == 4)
+        && !is_simd_reg(ops[0])) {
+        uint32_t rd, rn, rm;
+        if (!parse_reg(ops[0], rd) || !parse_reg(ops[1], rn)) { r.error = "reg"; return r; }
+        bool w = is_32bit(ops[0]);
+        bool rd_sp = is_sp(ops[0]);
+        bool rn_sp = is_sp(ops[1]);
+        if (parse_reg(ops[2], rm)) {
+            if (is_sp(ops[2])) { r.error = "Rm sp olamaz"; return r; }
+            if (ops.size() == 4) {
+                if (rd_sp || rn_sp) { r.error = "shifted form: sp"; return r; }
+                uint32_t st, sa;
+                if (!parse_shift(ops[3], st, sa)) { r.error = "shift"; return r; }
+                if (st == 3) { r.error = "add/sub ror yok"; return r; }
+                uint32_t max_sh = w ? 31 : 63;
+                if (sa > max_sh) { r.error = "shift amount"; return r; }
+                uint32_t base = (mnemonic == "add")
+                                ? (w ? 0x0B000000u : 0x8B000000u)
+                                : (w ? 0x4B000000u : 0xCB000000u);
+                r.value = base | (st << 22) | (rm << 16) | (sa << 10) | (rn << 5) | rd;
+                r.ok = true; return r;
+            }
+            uint32_t base;
+            if (rd_sp || rn_sp) {
+                if (mnemonic == "add") base = w ? 0x0B206000u : 0x8B206000u;
+                else                  base = w ? 0x4B206000u : 0xCB206000u;
+            } else {
+                if (mnemonic == "add") base = w ? 0x0B000000u : 0x8B000000u;
+                else                  base = w ? 0x4B000000u : 0xCB000000u;
+            }
+            r.value = base | (rm << 16) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+        if (ops.size() == 4) {
+            uint64_t imm = 0;
+            uint32_t st = 0, sa = 0;
+            if (parse_shift(ops[3], st, sa) && st == 0 && (sa == 0 || sa == 12)) {
+                if (parse_imm(ops[2], imm) && imm <= 0xFFF) {
+                    uint32_t sh = (sa == 12) ? 1 : 0;
+                    uint32_t base = (mnemonic == "add")
+                                    ? (w ? 0x11000000u : 0x91000000u)
+                                    : (w ? 0x51000000u : 0xD1000000u);
+                    r.value = base | (sh << 22) | ((uint32_t)imm << 10) | (rn << 5) | rd;
+                    r.ok = true; return r;
+                }
+            }
+            r.error = "imm form 4 ops"; return r;
+        }
+        uint64_t imm;
+        if (!parse_imm(ops[2], imm) || imm > 0xFFF) { r.error = "imm"; return r; }
+        uint32_t base = (mnemonic == "add")
+                        ? (w ? 0x11000000u : 0x91000000u)
+                        : (w ? 0x51000000u : 0xD1000000u);
+        r.value = base | ((uint32_t)imm << 10) | (rn << 5) | rd;
+        r.ok = true; return r;
+    }
+
+    // ---- cmp/cmn extended register form ----
+    if ((mnemonic == "cmp" || mnemonic == "cmn") && ops.size() == 3) {
+        uint32_t rn, rm;
+        if (parse_reg(ops[0], rn) && parse_reg(ops[1], rm)) {
+            std::string ext = ops[2];
+            uint32_t option = 3; bool is_ext = false;
+            if      (ext.find("uxtb") != std::string::npos) { option = 0; is_ext = true; }
+            else if (ext.find("uxth") != std::string::npos) { option = 1; is_ext = true; }
+            else if (ext.find("uxtw") != std::string::npos) { option = 2; is_ext = true; }
+            else if (ext.find("uxtx") != std::string::npos) { option = 3; is_ext = true; }
+            else if (ext.find("sxtb") != std::string::npos) { option = 4; is_ext = true; }
+            else if (ext.find("sxth") != std::string::npos) { option = 5; is_ext = true; }
+            else if (ext.find("sxtw") != std::string::npos) { option = 6; is_ext = true; }
+            else if (ext.find("sxtx") != std::string::npos) { option = 7; is_ext = true; }
+            if (is_ext) {
+                uint32_t imm3 = 0;
+                size_t hash = ext.find('#');
+                if (hash != std::string::npos) {
+                    uint64_t sh = 0;
+                    if (parse_imm(ext.substr(hash), sh) && sh <= 4) imm3 = (uint32_t)sh;
+                }
+                bool w = is_32bit(ops[0]);
+                bool is_cmn = (mnemonic == "cmn");
+                uint32_t base = is_cmn ? (w ? 0x2B200000u : 0xAB200000u)
+                                       : (w ? 0x6B200000u : 0xEB200000u);
+                r.value = base | (rm << 16) | (option << 13) | (imm3 << 10)
+                        | (rn << 5) | 31;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- cmp / cmn / tst ----
+    if ((mnemonic == "cmp" || mnemonic == "cmn" || mnemonic == "tst")
+        && (ops.size() == 2 || ops.size() == 3) && !is_simd_reg(ops[0])) {
+        uint32_t rn;
+        if (!parse_reg(ops[0], rn)) { r.error = "rn"; return r; }
+        bool w = is_32bit(ops[0]);
+        bool rn_sp = is_sp(ops[0]);
+        uint32_t rm;
+        if (parse_reg(ops[1], rm)) {
+            if (is_sp(ops[1])) { r.error = "Rm sp olamaz"; return r; }
+            if (ops.size() == 3) {
+                if (rn_sp) { r.error = "sp shifted"; return r; }
+                uint32_t st, sa;
+                if (!parse_shift(ops[2], st, sa)) { r.error = "shift"; return r; }
+                uint32_t max_sh = w ? 31 : 63;
+                if (sa > max_sh) { r.error = "shift amount"; return r; }
+                uint32_t base;
+                if      (mnemonic == "cmp") base = w ? 0x6B000000u : 0xEB000000u;
+                else if (mnemonic == "cmn") base = w ? 0x2B000000u : 0xAB000000u;
+                else                        base = w ? 0x6A000000u : 0xEA000000u;
+                r.value = base | (st << 22) | (rm << 16) | (sa << 10) | (rn << 5) | 31;
+                r.ok = true; return r;
+            }
+            uint32_t base;
+            if (mnemonic == "cmp") base = rn_sp ? (w ? 0x6B206000u : 0xEB206000u)
+                                                : (w ? 0x6B000000u : 0xEB000000u);
+            else if (mnemonic == "cmn") base = w ? 0x2B000000u : 0xAB000000u;
+            else                        base = w ? 0x6A000000u : 0xEA000000u;
+            r.value = base | (rm << 16) | (rn << 5) | 31;
+            r.ok = true; return r;
+        }
+        if (mnemonic == "tst" && ops.size() == 2) {
+            uint64_t imm = 0;
+            if (parse_imm(ops[1], imm)) {
+                int width = w ? 32 : 64;
+                uint64_t val = imm & (w ? 0xFFFFFFFFu : ~0ULL);
+                uint32_t N, immr, imms;
+                if (encode_bitmask_imm(val, width, N, immr, imms)) {
+                    uint32_t base = w ? 0x7200001Fu : 0xF200001Fu;
+                    r.value = base | (N << 22) | (immr << 16) | (imms << 10)
+                            | (rn << 5);
+                    r.ok = true; return r;
+                }
+            }
+        }
+        if (mnemonic == "tst") { r.error = "tst imm yok"; return r; }
+        uint64_t imm;
+        if (!parse_imm(ops[1], imm) || imm > 0xFFF) { r.error = "imm"; return r; }
+        uint32_t sh = 0;
+        if (ops.size() == 3) {
+            uint32_t st = 0, sa = 0;
+            if (parse_shift(ops[2], st, sa) && st == 0 && sa == 12) sh = 1;
+        }
+        uint32_t base = (mnemonic == "cmp")
+                        ? (w ? 0x71000000u : 0xF1000000u)
+                        : (w ? 0x31000000u : 0xB1000000u);
+        r.value = base | (sh << 22) | ((uint32_t)imm << 10) | (rn << 5) | 31;
+        r.ok = true; return r;
+    }
+
+    // ---- and/orr/eor/ands bitmask immediate ----
+    if ((mnemonic == "and" || mnemonic == "orr" ||
+         mnemonic == "eor" || mnemonic == "ands") && ops.size() == 3) {
+        uint32_t rd, rn, rm_check;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)
+            && !parse_reg(ops[2], rm_check)) {
+            uint64_t imm = 0;
+            int64_t simm = 0;
+            bool have = parse_imm(ops[2], imm);
+            if (!have && parse_imm_signed(ops[2], simm)) {
+                imm = (uint64_t)simm; have = true;
+            }
+            if (have) {
+                bool w = is_32bit(ops[0]);
+                int width = w ? 32 : 64;
+                uint64_t val = imm & (w ? 0xFFFFFFFFu : ~0ULL);
+                uint32_t N, immr, imms;
+                if (encode_bitmask_imm(val, width, N, immr, imms)) {
+                    uint32_t base;
+                    if (mnemonic == "and")  base = w ? 0x12000000u : 0x92000000u;
+                    if (mnemonic == "orr")  base = w ? 0x32000000u : 0xB2000000u;
+                    if (mnemonic == "eor")  base = w ? 0x52000000u : 0xD2000000u;
+                    if (mnemonic == "ands") base = w ? 0x72000000u : 0xF2000000u;
+                    r.value = base | (N << 22) | (immr << 16) | (imms << 10)
+                            | (rn << 5) | rd;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+    // ---- NEON 3-reg aritmetik ----
+    if ((mnemonic == "add" || mnemonic == "sub" || mnemonic == "mul" ||
+         mnemonic == "cmeq" || mnemonic == "cmge" || mnemonic == "cmgt" ||
+         mnemonic == "cmhi" || mnemonic == "cmhs") && ops.size() == 3) {
+        uint32_t rd, Q1, s1, e1, rn, Q2, s2, e2, rm, Q3, s3, e3;
+        if (parse_vec_reg(ops[0], rd, Q1, s1, e1) &&
+            parse_vec_reg(ops[1], rn, Q2, s2, e2) &&
+            parse_vec_reg(ops[2], rm, Q3, s3, e3)) {
+            if (Q1 == Q2 && Q1 == Q3 && s1 == s2 && s2 == s3) {
+                uint32_t base = 0;
+                if (mnemonic == "add")  base = 0x0E208400u;
+                if (mnemonic == "sub")  base = 0x2E208400u;
+                if (mnemonic == "mul")  base = 0x0E209C00u;
+                if (mnemonic == "cmeq") base = 0x2E208C00u;
+                if (mnemonic == "cmge") base = 0x0E203C00u;
+                if (mnemonic == "cmgt") base = 0x0E203400u;
+                if (mnemonic == "cmhi") base = 0x2E203400u;
+                if (mnemonic == "cmhs") base = 0x2E203C00u;
+                r.value = base | (Q1 << 30) | (s1 << 22)
+                        | (rm << 16) | (rn << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+
+    // ---- NEON 3-reg logical (and/orr/eor/bic/orn) ----
+    if ((mnemonic == "and" || mnemonic == "orr" || mnemonic == "eor" ||
+         mnemonic == "bic" || mnemonic == "orn" ||
+         mnemonic == "bsl" || mnemonic == "bit" || mnemonic == "bif") && ops.size() == 3) {
+        uint32_t rd, Q1, s1, e1, rn, Q2, s2, e2, rm, Q3, s3, e3;
+        if (parse_vec_reg(ops[0], rd, Q1, s1, e1) &&
+            parse_vec_reg(ops[1], rn, Q2, s2, e2) &&
+            parse_vec_reg(ops[2], rm, Q3, s3, e3)) {
+            if (Q1 == Q2 && Q1 == Q3 && s1 == s2 && s2 == s3) {
+                uint32_t base = 0;
+                if (mnemonic == "and") base = 0x0E201C00u;
+                if (mnemonic == "bic") base = 0x0E601C00u;
+                if (mnemonic == "orr") base = 0x0EA01C00u;
+                if (mnemonic == "orn") base = 0x0EE01C00u;
+                if (mnemonic == "eor") base = 0x2E201C00u;
+                if (mnemonic == "bsl") base = 0x2E601C00u;
+                if (mnemonic == "bit") base = 0x2EA01C00u;
+                if (mnemonic == "bif") base = 0x2EE01C00u;
+                r.value = base | (Q1 << 30) | (rm << 16) | (rn << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- bitwise ----
+    if ((mnemonic == "and"  || mnemonic == "orr"  || mnemonic == "eor" ||
+         mnemonic == "ands" || mnemonic == "bic"  || mnemonic == "orn" ||
+         mnemonic == "eon"  || mnemonic == "bics")
+        && (ops.size() == 3 || ops.size() == 4) && !is_simd_reg(ops[0])) {
+        uint32_t rd, rn, rm;
+        if (!parse_reg(ops[0], rd) || !parse_reg(ops[1], rn) || !parse_reg(ops[2], rm)) {
+            r.error = "bitwise reg"; return r;
+        }
+        bool w = is_32bit(ops[0]);
+        uint32_t base = 0;
+        if (mnemonic == "and")  base = w ? 0x0A000000u : 0x8A000000u;
+        if (mnemonic == "orr")  base = w ? 0x2A000000u : 0xAA000000u;
+        if (mnemonic == "eor")  base = w ? 0x4A000000u : 0xCA000000u;
+        if (mnemonic == "ands") base = w ? 0x6A000000u : 0xEA000000u;
+        if (mnemonic == "bic")  base = w ? 0x0A200000u : 0x8A200000u;
+        if (mnemonic == "orn")  base = w ? 0x2A200000u : 0xAA200000u;
+        if (mnemonic == "eon")  base = w ? 0x4A200000u : 0xCA200000u;
+        if (mnemonic == "bics") base = w ? 0x6A200000u : 0xEA200000u;
+        if (ops.size() == 4) {
+            uint32_t st, sa;
+            if (!parse_shift(ops[3], st, sa)) { r.error = "shift"; return r; }
+            uint32_t max_sh = w ? 31 : 63;
+            if (sa > max_sh) { r.error = "shift amount"; return r; }
+            r.value = base | (st << 22) | (rm << 16) | (sa << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+        r.value = base | (rm << 16) | (rn << 5) | rd;
+        r.ok = true; return r;
+    }
+
+    // ---- csel / csinc / csinv / csneg ----
+    if ((mnemonic == "csel" || mnemonic == "csinc" ||
+         mnemonic == "csinv" || mnemonic == "csneg") && ops.size() == 4) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            int cond = cond_to_num(ops[3]);
+            if (cond < 0) { r.error = "csel cond"; return r; }
+            bool w = is_32bit(ops[0]);
+            uint32_t base = w ? 0x1A800000u : 0x9A800000u;
+            uint32_t o2 = 0;
+            if (mnemonic == "csinc" || mnemonic == "csneg") o2 = 1;
+            if (mnemonic == "csinv" || mnemonic == "csneg") base |= 0x40000000u;
+            r.value = base | (rm << 16) | ((uint32_t)cond << 12)
+                    | (o2 << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- cset / csetm / cinc / cneg / cinv ----
+    if ((mnemonic == "cset" || mnemonic == "csetm" ||
+         mnemonic == "cinc" || mnemonic == "cneg" || mnemonic == "cinv")
+        && (ops.size() == 2 || ops.size() == 3)) {
+        uint32_t rd, rn = 31;
+        int cond_idx = 1;
+        if (parse_reg(ops[0], rd)) {
+            bool is_2op = (mnemonic == "cset" || mnemonic == "csetm");
+            if (!is_2op && ops.size() == 3) {
+                if (!parse_reg(ops[1], rn)) { r.error = "alias Rn"; return r; }
+                cond_idx = 2;
+            }
+            int cond = cond_to_num(ops[cond_idx]);
+            if (cond < 0) { r.error = "alias cond"; return r; }
+            int inv = cond ^ 1;
+            bool w = is_32bit(ops[0]);
+            uint32_t base = w ? 0x1A800000u : 0x9A800000u;
+            uint32_t o2 = 0;
+            if (mnemonic == "cset" || mnemonic == "cinc") o2 = 1;
+            if (mnemonic == "csetm" || mnemonic == "cinv") base |= 0x40000000u;
+            if (mnemonic == "cneg") { base |= 0x40000000u; o2 = 1; }
+            r.value = base | (rn << 16) | ((uint32_t)inv << 12)
+                    | (o2 << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- ccmp / ccmn ----
+    if ((mnemonic == "ccmp" || mnemonic == "ccmn") && ops.size() == 4) {
+        uint32_t rn;
+        if (parse_reg(ops[0], rn)) {
+            bool w = is_32bit(ops[0]);
+            bool is_cmn = (mnemonic == "ccmn");
+            int cond = cond_to_num(ops[3]);
+            if (cond < 0) { r.error = "ccmp cond"; return r; }
+            uint64_t nzcv = 0;
+            if (!parse_imm(ops[2], nzcv) || nzcv > 15) {
+                r.error = "ccmp nzcv"; return r;
+            }
+            uint32_t base;
+            if (is_cmn) base = w ? 0x3A400000u : 0xBA400000u;
+            else        base = w ? 0x7A400000u : 0xFA400000u;
+            uint32_t rm = 0;
+            if (parse_reg(ops[1], rm)) {
+                r.value = base | (rm << 16) | ((uint32_t)cond << 12)
+                        | (rn << 5) | (uint32_t)nzcv;
+                r.ok = true; return r;
+            }
+            uint64_t imm5 = 0;
+            if (parse_imm(ops[1], imm5) && imm5 <= 31) {
+                r.value = base | 0x800u
+                        | ((uint32_t)imm5 << 16) | ((uint32_t)cond << 12)
+                        | (rn << 5) | (uint32_t)nzcv;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- sxtb / sxth / sxtw / uxtb / uxth / uxtw ----
+    if ((mnemonic == "sxtb" || mnemonic == "sxth" || mnemonic == "sxtw" ||
+         mnemonic == "uxtb" || mnemonic == "uxth" || mnemonic == "uxtw")
+        && ops.size() == 2) {
+        uint32_t rd, rn;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            bool sgn = (mnemonic[0] == 's');
+            bool w_dst = is_32bit(ops[0]);
+            uint32_t imms = 0;
+            char sz = mnemonic[3];
+            if (sz == 'b') imms = 7;
+            else if (sz == 'h') imms = 15;
+            else imms = 31;
+            uint32_t base;
+            if (sgn) base = w_dst ? 0x13000000u : 0x93400000u;
+            else     base = w_dst ? 0x53000000u : 0xD3400000u;
+            r.value = base | (imms << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- extr ----
+    if (mnemonic == "extr" && ops.size() == 4) {
+        uint32_t rd, rn, rm;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            uint64_t sh;
+            if (!parse_imm(ops[3], sh)) { r.error = "extr imm"; return r; }
+            bool w = is_32bit(ops[0]);
+            uint32_t max_sh = w ? 31 : 63;
+            if (sh > max_sh) { r.error = "extr range"; return r; }
+            uint32_t base = w ? 0x13800000u : 0x93C00000u;
+            r.value = base | (rm << 16) | ((uint32_t)sh << 10)
+                    | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ============================================================
+    // B5a-part1: Load/store alt formlar (pre/post, reg offset, signed)
+    // ============================================================
+
+    // ---- pre-index [Rn, #imm]! ----
+    if ((mnemonic == "ldr" || mnemonic == "str" ||
+         mnemonic == "ldrb" || mnemonic == "strb" ||
+         mnemonic == "ldrh" || mnemonic == "strh" ||
+         mnemonic == "ldrsb" || mnemonic == "ldrsh" ||
+         mnemonic == "ldrsw") && ops.size() == 2) {
+        std::string mem = ops[1];
+        if (!mem.empty() && mem.back() == '!') {
+            mem.pop_back();
+            uint32_t rt = 0, rn = 0;
+            int64_t imm = 0;
+            if (parse_reg(ops[0], rt) && parse_mem_signed(mem, rn, imm)) {
+                if (imm < -256 || imm > 255) { r.error = "pre imm9"; return r; }
+                uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+                uint32_t size = 0, opc = 0;
+                bool ld = (mnemonic[0] == 'l');
+                if (mnemonic == "ldr" || mnemonic == "str") {
+                    size = is_32bit(ops[0]) ? 2 : 3; opc = ld ? 1 : 0;
+                } else if (mnemonic == "ldrb" || mnemonic == "strb") {
+                    size = 0; opc = ld ? 1 : 0;
+                } else if (mnemonic == "ldrh" || mnemonic == "strh") {
+                    size = 1; opc = ld ? 1 : 0;
+                } else if (mnemonic == "ldrsb") {
+                    size = 0; opc = is_32bit(ops[0]) ? 3 : 2;
+                } else if (mnemonic == "ldrsh") {
+                    size = 1; opc = is_32bit(ops[0]) ? 3 : 2;
+                } else { size = 2; opc = 2; }
+                r.value = (size << 30) | 0x38000000u
+                        | (opc << 22) | (imm9 << 12) | (3u << 10)
+                        | (rn << 5) | rt;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- post-index [Rn], #imm ----
+    if ((mnemonic == "ldr" || mnemonic == "str" ||
+         mnemonic == "ldrb" || mnemonic == "strb" ||
+         mnemonic == "ldrh" || mnemonic == "strh" ||
+         mnemonic == "ldrsb" || mnemonic == "ldrsh" ||
+         mnemonic == "ldrsw") && ops.size() == 3) {
+        uint32_t rt = 0, rn = 0;
+        uint64_t dummy = 0;
+        int64_t imm = 0;
+        if (parse_reg(ops[0], rt) && parse_mem(ops[1], rn, dummy)
+            && dummy == 0 && parse_imm_signed(ops[2], imm)) {
+            if (imm < -256 || imm > 255) { r.error = "post imm9"; return r; }
+            uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+            uint32_t size = 0, opc = 0;
+            bool ld = (mnemonic[0] == 'l');
+            if (mnemonic == "ldr" || mnemonic == "str") {
+                size = is_32bit(ops[0]) ? 2 : 3; opc = ld ? 1 : 0;
+            } else if (mnemonic == "ldrb" || mnemonic == "strb") {
+                size = 0; opc = ld ? 1 : 0;
+            } else if (mnemonic == "ldrh" || mnemonic == "strh") {
+                size = 1; opc = ld ? 1 : 0;
+            } else if (mnemonic == "ldrsb") {
+                size = 0; opc = is_32bit(ops[0]) ? 3 : 2;
+            } else if (mnemonic == "ldrsh") {
+                size = 1; opc = is_32bit(ops[0]) ? 3 : 2;
+            } else { size = 2; opc = 2; }
+            r.value = (size << 30) | 0x38000000u
+                    | (opc << 22) | (imm9 << 12) | (1u << 10)
+                    | (rn << 5) | rt;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- ldrsb/ldrsh/ldrsw register offset ----
+    if ((mnemonic == "ldrsb" || mnemonic == "ldrsh" || mnemonic == "ldrsw")
+        && ops.size() == 2 && !is_simd_reg(ops[0])) {
+        std::string mem = ops[1];
+        if (mem.size() >= 5 && mem.front() == '[' && mem.back() == ']') {
+            auto parts = split_ops(mem.substr(1, mem.size() - 2));
+            if (parts.size() >= 2) {
+                uint32_t rt, rn, rm;
+                if (parse_reg(ops[0], rt) && parse_reg(parts[0], rn) && parse_reg(parts[1], rm)) {
+                    uint32_t option = 3, S = 0;
+                    if (parts.size() >= 3) {
+                        std::string sh = parts[2];
+                        size_t hash = sh.find('#');
+                        uint64_t amt = 0;
+                        bool has_amt = (hash != std::string::npos
+                                        && parse_imm(sh.substr(hash), amt) && amt > 0);
+                        if      (sh.find("lsl")  != std::string::npos) { option = 3; S = has_amt ? 1 : 0; }
+                        else if (sh.find("uxtw") != std::string::npos) { option = 2; S = has_amt ? 1 : 0; }
+                        else if (sh.find("sxtw") != std::string::npos) { option = 6; S = has_amt ? 1 : 0; }
+                        else if (sh.find("sxtx") != std::string::npos) { option = 7; S = has_amt ? 1 : 0; }
+                    }
+                    uint32_t size = 0, opc = 0;
+                    if (mnemonic == "ldrsb") {
+                        size = 0; opc = is_32bit(ops[0]) ? 3 : 2;
+                    } else if (mnemonic == "ldrsh") {
+                        size = 1; opc = is_32bit(ops[0]) ? 3 : 2;
+                    } else {
+                        size = 2; opc = 2;
+                    }
+                    r.value = (size << 30) | 0x38200800u
+                            | (opc << 22) | (rm << 16)
+                            | (option << 13) | (S << 12)
+                            | (rn << 5) | rt;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- ldrsb/ldrsh/ldrsw unsigned offset ----
+    if ((mnemonic == "ldrsb" || mnemonic == "ldrsh" || mnemonic == "ldrsw")
+        && ops.size() == 2 && !is_simd_reg(ops[0])) {
+        std::string mem = ops[1];
+        if (!mem.empty() && mem.back() != '!') {
+            uint32_t rt = 0, rn = 0; uint64_t imm = 0;
+            if (parse_reg(ops[0], rt) && parse_mem(mem, rn, imm)) {
+                uint32_t size = 0, opc = 0; size_t scale = 1;
+                if (mnemonic == "ldrsb") {
+                    size = 0; opc = is_32bit(ops[0]) ? 3 : 2;
+                } else if (mnemonic == "ldrsh") {
+                    size = 1; opc = is_32bit(ops[0]) ? 3 : 2; scale = 2;
+                } else { size = 2; opc = 2; scale = 4; }
+                if (imm % scale != 0) { r.error = "scale"; return r; }
+                uint32_t imm12 = (uint32_t)(imm / scale);
+                if (imm12 > 0xFFF) { r.error = "imm12"; return r; }
+                r.value = (size << 30) | 0x39000000u
+                        | (opc << 22) | (imm12 << 10) | (rn << 5) | rt;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- ldursb/ldursh/ldursw ----
+    if ((mnemonic == "ldursb" || mnemonic == "ldursh" || mnemonic == "ldursw")
+        && ops.size() == 2) {
+        uint32_t rt = 0, rn = 0; int64_t imm = 0;
+        if (parse_reg(ops[0], rt) && parse_mem_signed(ops[1], rn, imm)) {
+            if (imm < -256 || imm > 255) { r.error = "imm9"; return r; }
+            uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+            uint32_t size = 0, opc = 0;
+            if (mnemonic == "ldursb") {
+                size = 0; opc = is_32bit(ops[0]) ? 3 : 2;
+            } else if (mnemonic == "ldursh") {
+                size = 1; opc = is_32bit(ops[0]) ? 3 : 2;
+            } else { size = 2; opc = 2; }
+            r.value = (size << 30) | 0x38000000u
+                    | (opc << 22) | (imm9 << 12) | (0u << 10)
+                    | (rn << 5) | rt;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- ldr/str register offset [Rn, Rm, lsl #N] ----
+    if ((mnemonic == "ldr" || mnemonic == "str" ||
+         mnemonic == "ldrb" || mnemonic == "strb" ||
+         mnemonic == "ldrh" || mnemonic == "strh") && ops.size() == 2) {
+        std::string mem = ops[1];
+        if (mem.size() >= 5 && mem.front() == '[' && mem.back() == ']') {
+            auto parts = split_ops(mem.substr(1, mem.size() - 2));
+            if (parts.size() >= 2) {
+                uint32_t rt = 0, rn = 0, rm = 0;
+                if (parse_reg(ops[0], rt) && parse_reg(parts[0], rn)
+                    && parse_reg(parts[1], rm)) {
+                    uint32_t option = 3, S = 0;
+                    if (parts.size() >= 3) {
+                        std::string sh = parts[2];
+                        size_t hash = sh.find('#');
+                        uint64_t amt = 0;
+                        bool has_amt = (hash != std::string::npos && parse_imm(sh.substr(hash), amt) && amt > 0);
+                        if (sh.find("lsl") != std::string::npos) {
+                            option = 3; S = has_amt ? 1 : 0;
+                        } else if (sh.find("uxtw") != std::string::npos) {
+                            option = 2; S = has_amt ? 1 : 0;
+                        } else if (sh.find("sxtw") != std::string::npos) {
+                            option = 6; S = has_amt ? 1 : 0;
+                        } else if (sh.find("sxtx") != std::string::npos) {
+                            option = 7; S = has_amt ? 1 : 0;
+                        }
+                    }
+                    uint32_t size = 0, opc = 0;
+                    bool ld = (mnemonic[0] == 'l');
+                    if (mnemonic == "ldr" || mnemonic == "str") {
+                        size = is_32bit(ops[0]) ? 2 : 3; opc = ld ? 1 : 0;
+                    } else if (mnemonic == "ldrb" || mnemonic == "strb") {
+                        size = 0; opc = ld ? 1 : 0;
+                    } else { size = 1; opc = ld ? 1 : 0; }
+                    r.value = (size << 30) | 0x38200800u
+                            | (opc << 22) | (rm << 16)
+                            | (option << 13) | (S << 12)
+                            | (rn << 5) | rt;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- madd / msub / mul / mneg ----
+    if ((mnemonic == "madd" || mnemonic == "msub" ||
+         mnemonic == "mul"  || mnemonic == "mneg")
+        && (ops.size() == 3 || ops.size() == 4)) {
+        uint32_t rd = 0, rn = 0, rm = 0, ra = 31;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn) && parse_reg(ops[2], rm)) {
+            bool w = is_32bit(ops[0]);
+            bool is_sub = (mnemonic == "msub" || mnemonic == "mneg");
+            bool ra_ok = true;
+            if ((mnemonic == "madd" || mnemonic == "msub") && ops.size() == 4) {
+                if (!parse_reg(ops[3], ra)) { r.error = "madd Ra"; return r; }
+            } else if ((mnemonic == "mul" || mnemonic == "mneg") && ops.size() == 4) {
+                r.error = "mul 4 ops"; return r;
+            }
+            (void)ra_ok;
+            uint32_t base = (w ? 0x1B000000u : 0x9B000000u)
+                          | (is_sub ? 0x8000u : 0u);
+            r.value = base | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- adds / subs ----
+    if ((mnemonic == "adds" || mnemonic == "subs")
+        && (ops.size() == 3 || ops.size() == 4)) {
+        uint32_t rd = 0, rn = 0, rm = 0;
+        if (parse_reg(ops[0], rd) && parse_reg(ops[1], rn)) {
+            bool w = is_32bit(ops[0]);
+            bool is_sub = (mnemonic == "subs");
+            if (parse_reg(ops[2], rm)) {
+                uint32_t base = is_sub ? (w ? 0x6B000000u : 0xEB000000u)
+                                       : (w ? 0x2B000000u : 0xAB000000u);
+                if (ops.size() == 4) {
+                    uint32_t st = 0, sa = 0;
+                    if (!parse_shift(ops[3], st, sa)) { r.error = "shift"; return r; }
+                    if (st == 3) { r.error = "ror yok"; return r; }
+                    uint32_t max_sh = w ? 31 : 63;
+                    if (sa > max_sh) { r.error = "shamt"; return r; }
+                    r.value = base | (st << 22) | (rm << 16) | (sa << 10)
+                            | (rn << 5) | rd;
+                } else {
+                    r.value = base | (rm << 16) | (rn << 5) | rd;
+                }
+                r.ok = true; return r;
+            }
+            if (ops.size() == 4) { r.error = "adds/subs imm 4 ops"; return r; }
+            uint64_t imm = 0;
+            if (parse_imm(ops[2], imm) && imm <= 0xFFF) {
+                uint32_t base = is_sub ? (w ? 0x71000000u : 0xF1000000u)
+                                       : (w ? 0x31000000u : 0xB1000000u);
+                r.value = base | ((uint32_t)imm << 10) | (rn << 5) | rd;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- fmov (scalar S/D) ----
+    if (mnemonic == "fmov" && ops.size() == 2) {
+        SimdInfo dst, src;
+        uint32_t rdg = 0, rng = 0;
+        bool ds = (ops[0].size() >= 2 && ops[0][0] == 's' && ops[0][1] >= '0' && ops[0][1] <= '9');
+        bool dd = (ops[0].size() >= 2 && ops[0][0] == 'd' && ops[0][1] >= '0' && ops[0][1] <= '9');
+        bool ss = (ops[1].size() >= 2 && ops[1][0] == 's' && ops[1][1] >= '0' && ops[1][1] <= '9');
+        bool sd = (ops[1].size() >= 2 && ops[1][0] == 'd' && ops[1][1] >= '0' && ops[1][1] <= '9');
+        bool dw = (ops[0].size() >= 2 && ops[0][0] == 'w' && parse_reg(ops[0], rdg));
+        bool dx = (ops[0].size() >= 2 && ops[0][0] == 'x' && parse_reg(ops[0], rdg));
+        bool sw = (ops[1].size() >= 2 && ops[1][0] == 'w' && parse_reg(ops[1], rng));
+        bool sx = (ops[1].size() >= 2 && ops[1][0] == 'x' && parse_reg(ops[1], rng));
+
+        if (ds && ss && parse_simd_reg(ops[0], dst) && parse_simd_reg(ops[1], src)) {
+            r.value = 0x1E204000u | (src.num << 5) | dst.num;
+            r.ok = true; return r;
+        }
+        if (dd && sd && parse_simd_reg(ops[0], dst) && parse_simd_reg(ops[1], src)) {
+            r.value = 0x1E604000u | (src.num << 5) | dst.num;
+            r.ok = true; return r;
+        }
+        if (dw && ss && parse_simd_reg(ops[1], src)) {
+            r.value = 0x1E260000u | (src.num << 5) | rdg;
+            r.ok = true; return r;
+        }
+        if (dx && sd && parse_simd_reg(ops[1], src)) {
+            r.value = 0x9E660000u | (src.num << 5) | rdg;
+            r.ok = true; return r;
+        }
+        if (ds && sw && parse_simd_reg(ops[0], dst)) {
+            r.value = 0x1E270000u | (rng << 5) | dst.num;
+            r.ok = true; return r;
+        }
+        if (dd && sx && parse_simd_reg(ops[0], dst)) {
+            r.value = 0x9E670000u | (rng << 5) | dst.num;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- fmov (register move + bitcast) ----
+    if (mnemonic == "fmov" && ops.size() == 2) {
+        SimdInfo d, n;
+        uint32_t rd, rn;
+
+        // fmov sD, sN / fmov dD, dN  (register move)
+        if (parse_simd_reg(ops[0], d) && parse_simd_reg(ops[1], n)) {
+            if (ops[0][0] == 's' && ops[1][0] == 's') {
+                r.value = 0x1E204000u | (n.num << 5) | d.num;
+                r.ok = true; return r;
+            }
+            if (ops[0][0] == 'd' && ops[1][0] == 'd') {
+                r.value = 0x1E604000u | (n.num << 5) | d.num;
+                r.ok = true; return r;
+            }
+        }
+        // fmov wD, sN     (fp -> int32)
+        if (parse_reg(ops[0], rd) && ops[0][0] == 'w'
+            && parse_simd_reg(ops[1], n) && ops[1][0] == 's') {
+            r.value = 0x1E260000u | (n.num << 5) | rd;
+            r.ok = true; return r;
+        }
+        // fmov sD, wN     (int32 -> fp)
+        if (parse_simd_reg(ops[0], d) && ops[0][0] == 's'
+            && parse_reg(ops[1], rn) && ops[1][0] == 'w') {
+            r.value = 0x1E270000u | (rn << 5) | d.num;
+            r.ok = true; return r;
+        }
+        // fmov xD, dN     (fp -> int64)
+        if (parse_reg(ops[0], rd) && ops[0][0] == 'x'
+            && parse_simd_reg(ops[1], n) && ops[1][0] == 'd') {
+            r.value = 0x9E660000u | (n.num << 5) | rd;
+            r.ok = true; return r;
+        }
+        // fmov dD, xN     (int64 -> fp)
+        if (parse_simd_reg(ops[0], d) && ops[0][0] == 'd'
+            && parse_reg(ops[1], rn) && ops[1][0] == 'x') {
+            r.value = 0x9E670000u | (rn << 5) | d.num;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- FP scalar 1-kaynak (fabs/fneg/fsqrt) ----
+    if ((mnemonic == "fabs" || mnemonic == "fneg" || mnemonic == "fsqrt")
+        && ops.size() == 2) {
+        SimdInfo d, n;
+        if (parse_simd_reg(ops[0], d) && parse_simd_reg(ops[1], n)) {
+            bool is_d = (ops[0][0] == 'd');
+            uint32_t base = 0;
+            if (mnemonic == "fabs")  base = is_d ? 0x1E60C000u : 0x1E20C000u;
+            if (mnemonic == "fneg")  base = is_d ? 0x1E614000u : 0x1E214000u;
+            if (mnemonic == "fsqrt") base = is_d ? 0x1E61C000u : 0x1E21C000u;
+            r.value = base | (n.num << 5) | d.num;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- FP scalar 2-kaynak (fadd/fsub/fmul/fdiv/fmax/fmin) ----
+    if ((mnemonic == "fadd" || mnemonic == "fsub" || mnemonic == "fmul" ||
+         mnemonic == "fdiv" || mnemonic == "fmax" || mnemonic == "fmin")
+        && ops.size() == 3) {
+        SimdInfo d, n, m;
+        if (parse_simd_reg(ops[0], d) && parse_simd_reg(ops[1], n)
+            && parse_simd_reg(ops[2], m)) {
+            bool is_d = (ops[0][0] == 'd');
+            uint32_t base = 0;
+            if (mnemonic == "fmul") base = is_d ? 0x1E600800u : 0x1E200800u;
+            if (mnemonic == "fdiv") base = is_d ? 0x1E601800u : 0x1E201800u;
+            if (mnemonic == "fadd") base = is_d ? 0x1E602800u : 0x1E202800u;
+            if (mnemonic == "fsub") base = is_d ? 0x1E603800u : 0x1E203800u;
+            if (mnemonic == "fmax") base = is_d ? 0x1E604800u : 0x1E204800u;
+            if (mnemonic == "fmin") base = is_d ? 0x1E605800u : 0x1E205800u;
+            r.value = base | (m.num << 16) | (n.num << 5) | d.num;
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- fcmp (scalar) ----
+    if (mnemonic == "fcmp" && ops.size() == 2) {
+        SimdInfo n, m;
+        if (parse_simd_reg(ops[0], n) && parse_simd_reg(ops[1], m)) {
+            bool is_d = (ops[0][0] == 'd');
+            uint32_t base = is_d ? 0x1E602000u : 0x1E202000u;
+            r.value = base | (m.num << 16) | (n.num << 5);
+            r.ok = true; return r;
+        }
+    }
+
+    // ---- SIMD ldr/str (unsigned offset) ----
+    if ((mnemonic == "ldr" || mnemonic == "str")
+        && ops.size() == 2 && is_simd_reg(ops[0])) {
+        SimdInfo info;
+        uint32_t rn; uint64_t imm;
+        if (parse_simd_reg(ops[0], info) && parse_mem(ops[1], rn, imm)) {
+            bool is_q = (ops[0][0] == 'q');
+            size_t scale = info.scale;
+            if (imm % scale == 0) {
+                uint32_t imm12 = (uint32_t)(imm / scale);
+                if (imm12 <= 0xFFF) {
+                    bool ld = (mnemonic == "ldr");
+                    uint32_t opc = is_q ? (ld ? 3u : 2u) : (ld ? 1u : 0u);
+                    r.value = 0x3D000000u | (info.size << 30)
+                            | (opc << 22)
+                            | (imm12 << 10) | (rn << 5) | info.num;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- ldr/str (unsigned offset) ----
+    if ((mnemonic == "ldr" || mnemonic == "str") && ops.size() == 2
+        && !is_simd_reg(ops[0])) {
+        uint32_t rt, rn;
+        uint64_t imm;
+        if (!parse_reg(ops[0], rt)) { r.error = "Rt"; return r; }
+        if (!parse_mem(ops[1], rn, imm)) { r.error = "mem"; return r; }
+        bool w = is_32bit(ops[0]);
+        size_t scale = w ? 4 : 8;
+        if (imm % scale != 0) { r.error = "scale"; return r; }
+        uint32_t imm12 = (uint32_t)(imm / scale);
+        if (imm12 > 0xFFF) { r.error = "imm12"; return r; }
+        uint32_t base;
+        if (mnemonic == "ldr") base = w ? 0xB9400000u : 0xF9400000u;
+        else                   base = w ? 0xB9000000u : 0xF9000000u;
+        r.value = base | (imm12 << 10) | (rn << 5) | rt;
+        r.ok = true; return r;
+    }
+
+    // ---- ldrb/strb/ldrh/strh ----
+    if ((mnemonic == "ldrb" || mnemonic == "strb" ||
+         mnemonic == "ldrh" || mnemonic == "strh") && ops.size() == 2) {
+        uint32_t rt, rn;
+        uint64_t imm;
+        if (!parse_reg(ops[0], rt)) { r.error = "Rt"; return r; }
+        if (!parse_mem(ops[1], rn, imm)) { r.error = "mem"; return r; }
+        size_t scale = (mnemonic == "ldrb" || mnemonic == "strb") ? 1 : 2;
+        if (imm % scale != 0) { r.error = "scale"; return r; }
+        uint32_t imm12 = (uint32_t)(imm / scale);
+        if (imm12 > 0xFFF) { r.error = "imm12"; return r; }
+        uint32_t base = 0;
+        if (mnemonic == "ldrb") base = 0x39400000u;
+        if (mnemonic == "strb") base = 0x39000000u;
+        if (mnemonic == "ldrh") base = 0x79400000u;
+        if (mnemonic == "strh") base = 0x79000000u;
+        r.value = base | (imm12 << 10) | (rn << 5) | rt;
+        r.ok = true; return r;
+    }
+
+    // ---- SIMD ldr/str pre-index ve register offset ----
+    if ((mnemonic == "ldr" || mnemonic == "str")
+        && (ops.size() == 2 || ops.size() == 3) && is_simd_reg(ops[0])) {
+        SimdInfo info;
+        if (parse_simd_reg(ops[0], info)) {
+            std::string mem = ops.size() >= 2 ? ops[1] : "";
+            bool is_q = (ops[0][0] == 'q');
+            bool ld = (mnemonic == "ldr");
+            uint32_t opc = is_q ? (ld ? 3u : 2u) : (ld ? 1u : 0u);
+
+            // pre-index: [Rn, #imm]!
+            if (!mem.empty() && mem.back() == '!') {
+                std::string inner = mem.substr(0, mem.size() - 1);
+                uint32_t rn; int64_t imm;
+                if (parse_mem_signed(inner, rn, imm) && imm >= -256 && imm <= 255) {
+                    uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+                    r.value = 0x3C000000u | (info.size << 30)
+                            | (opc << 22) | (imm9 << 12) | (3u << 10)
+                            | (rn << 5) | info.num;
+                    r.ok = true; return r;
+                }
+            }
+            // register offset: [Rn, Rm, ...]
+            // post-index: [Rn], #imm
+            if (ops.size() == 3) {
+                uint32_t rn; uint64_t dummy; int64_t imm;
+                if (parse_mem(ops[1], rn, dummy) && dummy == 0
+                    && parse_imm_signed(ops[2], imm) && imm >= -256 && imm <= 255) {
+                    uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+                    r.value = 0x3C000000u | (info.size << 30)
+                            | (opc << 22) | (imm9 << 12) | (1u << 10)
+                            | (rn << 5) | info.num;
+                    r.ok = true; return r;
+                }
+            }
+            if (mem.size() >= 2 && mem.front() == '[' && mem.back() == ']') {
+                auto parts = split_ops(mem.substr(1, mem.size() - 2));
+                if (parts.size() >= 2) {
+                    uint32_t rn, rm;
+                    if (parse_reg(parts[0], rn) && parse_reg(parts[1], rm)) {
+                        uint32_t opt = 3, S = 0;
+                        if (parts.size() >= 3) {
+                            std::string sh = parts[2];
+                            size_t hash = sh.find('#');
+                            if (hash != std::string::npos) {
+                                uint64_t amt = 0;
+                                if (parse_imm(sh.substr(hash), amt) && amt > 0) S = 1;
+                            }
+                            if (sh.find("uxtw") != std::string::npos) opt = 2;
+                            else if (sh.find("sxtw") != std::string::npos) opt = 6;
+                            else if (sh.find("sxtx") != std::string::npos) opt = 7;
+                        }
+                        r.value = 0x3C200800u | (info.size << 30)
+                                | (opc << 22) | (rm << 16)
+                                | (opt << 13) | (S << 12)
+                                | (rn << 5) | info.num;
+                        r.ok = true; return r;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- SIMD ldur/stur (unscaled) ----
+    if ((mnemonic == "ldur" || mnemonic == "stur")
+        && ops.size() == 2 && is_simd_reg(ops[0])) {
+        SimdInfo info;
+        uint32_t rn; int64_t imm;
+        if (parse_simd_reg(ops[0], info) && parse_mem_signed(ops[1], rn, imm)) {
+            if (imm >= -256 && imm <= 255) {
+                bool is_q = (ops[0][0] == 'q');
+                bool ld = (mnemonic == "ldur");
+                uint32_t opc = is_q ? (ld ? 3u : 2u) : (ld ? 1u : 0u);
+                uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+                r.value = 0x3C000000u | (info.size << 30)
+                        | (opc << 22) | (imm9 << 12)
+                        | (rn << 5) | info.num;
+                r.ok = true; return r;
+            }
+        }
+    }
+
+    // ---- ldrsw (unsigned + register offset) ----
+    if (mnemonic == "ldrsw" && ops.size() == 2) {
+        uint32_t rt, rn; uint64_t imm;
+        if (parse_reg(ops[0], rt) && ops[1].size() >= 2) {
+            std::string mem = ops[1];
+            if (mem.front() == '[' && mem.back() == ']') {
+                auto parts = split_ops(mem.substr(1, mem.size() - 2));
+                if (parts.size() >= 2) {
+                    uint32_t rm;
+                    if (parse_reg(parts[0], rn) && parse_reg(parts[1], rm)) {
+                        uint32_t opt = 3, S = 0;
+                        if (parts.size() >= 3) {
+                            std::string sh = parts[2];
+                            if (sh.find("uxtw") != std::string::npos) opt = 2;
+                            else if (sh.find("sxtw") != std::string::npos) opt = 6;
+                            else if (sh.find("sxtx") != std::string::npos) opt = 7;
+                            size_t hash = sh.find('#');
+                            if (hash != std::string::npos) {
+                                uint64_t amt = 0;
+                                if (parse_imm(sh.substr(hash), amt) && amt == 2) S = 1;
+                            }
+                        }
+                        r.value = 0xB8A00800u | (rm << 16) | (opt << 13)
+                                | (S << 12) | (rn << 5) | rt;
+                        r.ok = true; return r;
+                    }
+                }
+            }
+            if (parse_mem(mem, rn, imm) && imm % 4 == 0) {
+                uint32_t imm12 = (uint32_t)(imm / 4);
+                if (imm12 <= 0xFFF) {
+                    r.value = 0xB9800000u | (imm12 << 10) | (rn << 5) | rt;
+                    r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // ---- ldur/stur ----
+    if ((mnemonic == "ldur" || mnemonic == "stur" ||
+         mnemonic == "ldurb" || mnemonic == "sturb" ||
+         mnemonic == "ldurh" || mnemonic == "sturh") && ops.size() == 2
+        && !is_simd_reg(ops[0])) {
+        uint32_t rt, rn;
+        int64_t imm;
+        if (!parse_reg(ops[0], rt)) { r.error = "Rt"; return r; }
+        if (!parse_mem_signed(ops[1], rn, imm)) { r.error = "mem"; return r; }
+        if (imm < -256 || imm > 255) { r.error = "imm9"; return r; }
+        uint32_t imm9 = (uint32_t)imm & 0x1FFu;
+        bool is_ld = (mnemonic[0] == 'l');
+        bool is_b  = (mnemonic.back() == 'b');
+        bool is_h  = (mnemonic.back() == 'h');
+        uint32_t base;
+        if (is_ld) {
+            if (is_b) base = 0x38400000u;
+            else if (is_h) base = 0x78400000u;
+            else base = is_32bit(ops[0]) ? 0xB8400000u : 0xF8400000u;
+        } else {
+            if (is_b) base = 0x38000000u;
+            else if (is_h) base = 0x78000000u;
+            else base = is_32bit(ops[0]) ? 0xB8000000u : 0xF8000000u;
+        }
+        r.value = base | (imm9 << 12) | (rn << 5) | rt;
+        r.ok = true; return r;
+    }
+
+    r.error = "desteklenmeyen komut: " + mnemonic;
+    return r;
+}
+
+} // namespace opcodebyte
